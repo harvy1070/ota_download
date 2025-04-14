@@ -14,7 +14,27 @@ import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
+
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLSession;
 
 import okhttp3.Call;
 import okhttp3.Callback;
@@ -35,7 +55,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     private final String KEY_DOWNLOADED_BYTES = "downloadedBytes";
     private final String KEY_TOTAL_BYTES = "totalBytes";
     private final String KEY_DOWNLOAD_ID = "downloadId";
-
+    private Map<String, X509Certificate> loadedCertificates = new HashMap<>();
     private TextView tvCurrentVersion;
     private TextView tvStatus;
     private Button btnDownload;
@@ -129,10 +149,10 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 Log.v(TAG, "OkHttp: " + message));
         logging.setLevel(HttpLoggingInterceptor.Level.BASIC);
 
-        // OkHttp 클라이언트 생성
-        OkHttpClient client = new OkHttpClient.Builder()
-                .addInterceptor(logging)
-                .build();
+        // 커스텀 인증서를 사용하는 OkHttp 클라이언트 생성
+        OkHttpClient client = getSecureOkHttpClient();
+        // 로깅 인터셉터 추가
+        client = client.newBuilder().addInterceptor(logging).build();
 
         // 이미 다운로드된 바이트 수 확인
         long downloadedBytes = 0;
@@ -418,7 +438,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     private String formatFileSize(long size) {
         if (size <= 0) return "0 B";
 
-        final String[] units = new String[] { "B", "KB", "MB", "GB", "TB" };
+        final String[] units = new String[]{"B", "KB", "MB", "GB", "TB"};
         int digitGroups = (int) (Math.log10(size) / Math.log10(1024));
 
         return String.format("%.2f %s", size / Math.pow(1024, digitGroups), units[digitGroups]);
@@ -456,6 +476,199 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 saveDownloadInfo(currentSize, totalBytes, currentDownloadId);
                 Log.d(TAG, "앱 종료 시 다운로드 상태 저장: " + currentSize + "/" + totalBytes);
             }
+        }
+    }
+
+    private OkHttpClient getSecureOkHttpClient() {
+        try {
+            Log.d(TAG, "========== 인증서 로드 시작 ==========");
+
+            // 키 스토어 초기화
+            KeyStore keyStore = KeyStore.getInstance(KeyStore.getDefaultType());
+            keyStore.load(null, null);
+            Log.d(TAG, "빈 키스토어 생성 완료");
+
+            // 인증서 팩토리 생성
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            Log.d(TAG, "X.509 인증서 팩토리 생성 완료");
+
+            // 인증서 디렉토리 접근
+            File certsDir = new File("/sdcard/certificates/cacerts/");
+            Log.d(TAG, "인증서 디렉토리 경로 >> " + certsDir.getAbsolutePath());
+
+            int loadedCerts = 0;
+
+            // 디렉토리 내 모든 파일을 인증서로 취급(강제로)
+            if (certsDir.exists() && certsDir.isDirectory()) {
+                File[] certFiles = certsDir.listFiles();
+                if (certFiles != null & certFiles.length > 0) {
+                    Log.d(TAG, "인증서 디렉토리에서 " + certFiles.length + "개의 파일 발견");
+
+                    for (File certFile : certFiles) {
+                        if (certFile.isFile()) {
+                            try {
+                                Log.d(TAG, "인증서 파일 시도 >> " + certFile.getName());
+
+                                InputStream caInput = new FileInputStream(certFile);
+                                try {
+                                    Certificate ca = cf.generateCertificate(caInput);
+                                    X509Certificate x509Cert = (X509Certificate) ca;
+                                    loadedCertificates.put(certFile.getName(), x509Cert);
+                                    String subjectDN = x509Cert.getSubjectDN().getName();
+                                    String issuerDN = x509Cert.getIssuerDN().getName();
+                                    String serialNumber = x509Cert.getSerialNumber().toString(16);
+
+                                    Log.d(TAG, "인증서 로드 성공 >> " + certFile.getName());
+                                    Log.d(TAG, "주체 >> " + subjectDN);
+                                    Log.d(TAG, "발급자 >> " + issuerDN);
+                                    Log.d(TAG, "일련번호 >> " + serialNumber);
+                                    Log.d(TAG, "유효기간 >> " + x509Cert.getNotBefore() + " ~ " + x509Cert.getNotAfter());
+
+                                    // 키스토어에 인증서 추가(파일명 별칭으로 사용)
+                                    keyStore.setCertificateEntry(certFile.getName(), ca);
+                                    loadedCerts++;
+
+                                    Log.d(TAG, "인증서 키스토어 추가 완료 >> " + certFile.getName());
+                                } finally {
+                                    caInput.close();
+                                }
+                            } catch (Exception e) {
+                                Log.w(TAG, "인증서 로드 실패 >> " + certFile.getName(), e);
+                                // 개별 인증서 로드 실패는 무시하면서 계속 진행하도록 함
+                            }
+                        } else {
+                            Log.d(TAG, "건너 뜀 (디렉토리) >> " + certFile.getName());
+                        }
+                    }
+                } else {
+                    Log.e(TAG, "인증서 파일이 없음 >> " + certsDir.getAbsolutePath());
+                    throw new FileNotFoundException("인증서 파일 없음");
+                }
+            } else {
+                Log.e(TAG, "인증서 디렉토리가 없음 >> " + certsDir.getAbsolutePath());
+                throw new FileNotFoundException("인증서 디렉토리가 없음");
+            }
+
+            Log.d(TAG, "총 " + loadedCerts + "개의 인증서 로드 완료");
+
+            if (loadedCerts == 0) {
+                Log.e(TAG, "유효한 인증서가 하나도 로드되지 않음");
+                throw new Exception("유효한 인증서가 하나도 로드되지 않음");
+            }
+
+            // TrustManagerFactory 생성
+            Log.d(TAG, "=========== Trust Manager Factory 생성 시작 ===========");
+            TrustManagerFactory tmf = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+            tmf.init(keyStore);
+            Log.d(TAG, "TrustManagerFactory 초기화 완료 >> " + TrustManagerFactory.getDefaultAlgorithm());
+
+            // SSLContext 설정
+            Log.d(TAG, "=========== SSL Context 설정 시작 ===========");
+            SSLContext sslContext = SSLContext.getInstance("TLS");
+            sslContext.init(null, tmf.getTrustManagers(), null);
+            Log.d(TAG, "SSL Context 초기화 완료 (프로토콜 >> TLS)");
+
+            // TrustManager 정보 로깅
+            TrustManager[] trustManagers = tmf.getTrustManagers();
+            Log.d(TAG, "TrustManager 수 >> " + trustManagers.length);
+
+            for (int i = 0; i < trustManagers.length; i++) {
+                TrustManager tm = trustManagers[i];
+                Log.d(TAG, "TrustManager[" + i + "] 유형 >> " + tm.getClass().getName());
+
+                if (tm instanceof X509TrustManager) {
+                    X509TrustManager x509tm = (X509TrustManager) tm;
+                    X509Certificate[] acceptedIssuers = x509tm.getAcceptedIssuers();
+                    Log.d(TAG, "수락된 발급자 수 >> " + acceptedIssuers.length);
+
+                    for (int j = 0; j < Math.min(acceptedIssuers.length, 10); j++) {
+                        Log.d(TAG, "    발급자[" + j + "] >> " + acceptedIssuers[j].getSubjectDN().getName());
+                    }
+
+                    if (acceptedIssuers.length > 10) {
+                        Log.d(TAG, "    ... 그 외 " + (acceptedIssuers.length - 10) + "개");
+                    }
+                }
+            }
+
+            // OkHttp 클라이언트에 SSL 설정 적용
+            Log.d(TAG, "커스텀 인증서를 사용하는 OkHttpClient 생성");
+            return new OkHttpClient.Builder()
+                    .sslSocketFactory(sslContext.getSocketFactory(),
+                            (X509TrustManager) tmf.getTrustManagers()[0])
+                    .hostnameVerifier(new HostnameVerifier() {
+                        @Override
+                        public boolean verify(String hostname, SSLSession session) {
+                            Log.d(TAG, "호스트명 검증 >> " + hostname);
+                            try {
+                                Certificate[] certs = session.getPeerCertificates();
+                                Log.d(TAG, "서버 인증서 체인 >> " + certs.length + "개");
+
+                                // 서버 인증서 정보 먼저 출력
+                                for (int i = 0; i < certs.length; i++) {
+                                    if (certs[i] instanceof X509Certificate) {
+                                        X509Certificate cert = (X509Certificate) certs[i];
+                                        Log.d(TAG, "서버 인증서[" + i + "] >> " + cert.getSubjectDN().getName());
+                                        Log.d(TAG, "발급자 >> " + cert.getIssuerDN().getName());
+                                    }
+                                }
+
+                                // 어떤 인증서 파일이 사용되었는지 검사
+                                Log.d(TAG, "========= 로드된 인증서 중 사용된 인증서 확인 =========");
+                                boolean foundMatch = false;
+
+                                for (Map.Entry<String, X509Certificate> entry : loadedCertificates.entrySet()) {
+                                    String fileName = entry.getKey();
+                                    X509Certificate loadedCert = entry.getValue();
+
+                                    // 서버 인증서 체인과 로드된 인증서 비교
+                                    for (Certificate serverCert : certs) {
+                                        if (serverCert instanceof X509Certificate) {
+                                            X509Certificate serverX509 = (X509Certificate) serverCert;
+
+                                            // 인증서의 발급자가 로드된 인증서의 주체와 일치하는지 확인 (인증 체인 검증)
+                                            if (serverX509.getIssuerDN().getName().equals(loadedCert.getSubjectDN().getName())) {
+                                                Log.d(TAG, "MATCH FOUND: 파일 " + fileName + "이(가) 인증 체인에 사용됨");
+                                                Log.d(TAG, "  서버 인증서 발급자: " + serverX509.getIssuerDN().getName());
+                                                Log.d(TAG, "  로드된 인증서 주체: " + loadedCert.getSubjectDN().getName());
+                                                foundMatch = true;
+                                            }
+
+                                            // 완전히 동일한 인증서인지 확인
+                                            try {
+                                                if (Arrays.equals(serverX509.getEncoded(), loadedCert.getEncoded())) {
+                                                    Log.d(TAG, "EXACT MATCH: 파일 " + fileName + "이(가) 서버 인증서와 정확히 일치함");
+                                                    foundMatch = true;
+                                                }
+                                            } catch (Exception e) {
+                                                Log.e(TAG, "인증서 인코딩 비교 오류", e);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (!foundMatch) {
+                                    Log.d(TAG, "일치하는 인증서 파일을 찾을 수 없음 - 시스템 인증서 사용됨");
+                                }
+
+                            } catch (SSLPeerUnverifiedException e) {
+                                Log.e(TAG, "서버 인증서 검증 실패", e);
+                            }
+
+                            // 기본 호스트명 검증 사용
+                            HostnameVerifier defaultVerifier = HttpsURLConnection.getDefaultHostnameVerifier();
+                            boolean result = defaultVerifier.verify(hostname, session);
+                            Log.d(TAG, "호스트명 검증 결과 >> " + result);
+                            return result;
+                        }
+                    })
+                    .build();
+
+        } catch (Exception e) {
+            Log.e(TAG, "보안 OkHttp 클라이언트 생성 실패", e);
+
+            // 중요: 인증서 로드 실패 시 기본 클라이언트를 반환하지 않고 예외 발생시키기
+            throw new RuntimeException("커스텀 인증서 로드 실패", e);
         }
     }
 }
